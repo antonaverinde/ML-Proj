@@ -15,10 +15,12 @@ from .patch_extraction import extract_patches_from_image
 #import torchvision.transforms as T
 import torchvision.transforms.v2 as T
 from torchvision.transforms import InterpolationMode
+import torchvision.transforms.functional as TF
 
 train_transform = T.Compose([
     T.RandomHorizontalFlip(p=0.5),
     T.RandomVerticalFlip(p=0.5),
+    #T.RandomApply([T.RandomRotation(degrees=[0, 90])], p=1.0),-it has a different seed. cannot use it like this.
     #T.RandomRotation(degrees=30),
     # T.RandomAffine(
     #     degrees=0,
@@ -29,6 +31,7 @@ train_transform = T.Compose([
 mask_transform = T.Compose([
     T.RandomHorizontalFlip(p=0.5),
     T.RandomVerticalFlip(p=0.5),
+    #T.RandomApply([T.RandomRotation(degrees=[0, 90])], p=1.0), 
     #T.RandomRotation(degrees=30, interpolation=InterpolationMode.NEAREST),
     #T.RandomAffine(degrees=0, translate=(0.05,0.05), scale=(0.95,1.05), interpolation='nearest')
 ])
@@ -124,6 +127,9 @@ class PatchDataset(Dataset):
             patch_data = self.transform(patch_data)
             torch.manual_seed(seed)
             patch_mask = self.mask_transform(patch_mask)
+            angle = torch.FloatTensor(1).uniform_(-30, 30).item()
+            patch_data = TF.rotate(patch_data, angle, interpolation=InterpolationMode.BILINEAR)
+            patch_mask = TF.rotate(patch_mask, angle, interpolation=InterpolationMode.NEAREST)
         # Convert to torch tensors (C, H, W format for PyTorch)
         #patch_data = torch.from_numpy(patch_data.transpose(2, 0, 1).copy())
         #patch_mask = torch.from_numpy(patch_mask.copy()).float()

@@ -4,6 +4,8 @@ Loss functions for segmentation training (PyTorch).
 
 import torch
 import torch.nn as nn
+import numpy as np
+from scipy.ndimage import distance_transform_edt
 import torch.nn.functional as F
 from .lovasz_loss import lovasz_hinge
 
@@ -26,6 +28,125 @@ class DiceLoss(nn.Module):
         inter = (probs * targets).sum()
         dice = (2 * inter + self.eps) / (probs.sum() + targets.sum() + self.eps)
         return 1 - dice
+class DistanceWeightedSoftIoULoss(nn.Module):
+    def __init__(self, eps: float = 1e-6, alpha: float = 0.5, sigma: float = 50.0):
+        super().__init__()
+        self.eps = eps
+        self.alpha = alpha    # weight between soft IoU and distance penalty
+        self.sigma = sigma    # controls distance decay sharpness
+
+    def _distance_weight_map(self, targets: torch.Tensor) -> torch.Tensor:
+        """Compute per-pixel distance weight from true defect regions."""
+        targets_np = targets.cpu().numpy().astype(bool)
+        
+        # For each pixel, distance to nearest defect pixel
+        # If no defects in mask, distance map is all zeros (no penalty)
+        weight_map = np.zeros_like(targets_np, dtype=np.float32)
+        for i in range(targets_np.shape[0]):  # iterate over batch
+            mask = targets_np[i]
+            if mask.any():
+                dist = distance_transform_edt(~mask)  # distance from background to nearest defect
+                weight_map[i] = 1 - np.exp(-dist / self.sigma)  # exponential decay
+            # else: all zeros → no distance penalty for empty masks
+
+        return torch.from_numpy(weight_map).to(targets.device)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        probs = torch.sigmoid(logits)
+
+        # --- Soft IoU term ---
+        probs_flat = probs.flatten()
+        targets_flat = targets.flatten()
+        inter = (probs_flat * targets_flat).sum()
+        union = probs_flat.sum() + targets_flat.sum() - inter
+        soft_iou_loss = 1 - (inter + self.eps) / (union + self.eps)
+
+        # --- Distance penalty term ---
+        # weight_map: 0 near defects, → 1 far from defects
+        weight_map = self._distance_weight_map(targets)
+        false_positive_map = probs * (1 - targets)  # predicted defect, actually background
+        distance_penalty = (weight_map * false_positive_map).mean()
+
+        return soft_iou_loss + self.alpha * distance_penalty
+
+from scipy.ndimage import distance_transform_edt, label
+
+
+class DistanceWeightedSoftIoULossSmallExclude(nn.Module):
+    def __init__(
+        self,
+        eps: float = 1e-6,
+        alpha: float = 0.5,
+        sigma: float = 50.0,
+        min_defect_size: int = 0,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.alpha = alpha
+        self.sigma = sigma
+        self.min_defect_size = min_defect_size
+
+    def _small_defect_mask(self, targets_np: np.ndarray) -> np.ndarray:
+        """
+        Returns bool mask (B, H, W), True where a connected defect component
+        has area < min_defect_size. These pixels are excluded from loss entirely.
+        """
+        result = np.zeros_like(targets_np, dtype=bool)
+        if self.min_defect_size <= 0:
+            return result
+
+        for i in range(targets_np.shape[0]):
+            labeled, n_components = label(targets_np[i])
+            if n_components == 0:
+                continue
+            component_sizes = np.bincount(labeled.ravel())  # index 0 = background
+            small_ids = np.where(component_sizes < self.min_defect_size)[0]
+            small_ids = small_ids[small_ids > 0]  # exclude background
+            if small_ids.size > 0:
+                result[i] = np.isin(labeled, small_ids)
+
+        return result
+
+    def _distance_weight_map(self, targets_np: np.ndarray) -> torch.Tensor:
+        """
+        Per-pixel distance weight from true defect regions.
+        0 near defects, approaching 1 far from defects.
+        """
+        weight_map = np.zeros_like(targets_np, dtype=np.float32)
+        for i in range(targets_np.shape[0]):
+            mask = targets_np[i]
+            if mask.any():
+                dist = distance_transform_edt(~mask)
+                weight_map[i] = 1 - np.exp(-dist / self.sigma)
+        return torch.from_numpy(weight_map)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        probs = torch.sigmoid(logits)
+
+        targets_np = targets.cpu().numpy().astype(bool)
+
+        # valid_mask: True for pixels that should contribute to the loss
+        # excludes pixels belonging to small defect components
+        exclusion_mask = self._small_defect_mask(targets_np)
+        valid_mask = torch.from_numpy(~exclusion_mask).to(targets.device)  # (B, H, W)
+
+        # --- Soft IoU over valid pixels only ---
+        probs_valid = probs[valid_mask]
+        targets_valid = targets[valid_mask]
+
+        inter = (probs_valid * targets_valid).sum()
+        union = probs_valid.sum() + targets_valid.sum() - inter
+        soft_iou_loss = 1 - (inter + self.eps) / (union + self.eps)
+
+        # --- Distance penalty over valid pixels only ---
+        weight_map = self._distance_weight_map(targets_np).to(targets.device)
+        false_positive_map = probs * (1 - targets)
+        penalty_values = weight_map * false_positive_map
+        distance_penalty = penalty_values[valid_mask].mean()
+
+        return soft_iou_loss + self.alpha * distance_penalty
 class LogDiceLoss(nn.Module):
     def __init__(self, eps=1e-6):
         super().__init__()
@@ -167,6 +288,10 @@ def get_loss_function(loss_name: str, pos_w: float = 1.0, neg_w: float = 1.0,
         return TverskyLoss(alpha=alpha, beta=beta)
     elif loss_name == 'lovasz':
       return LovaszHingeLoss()
+    elif loss_name == 'distance_weighted_soft_iou':
+        return DistanceWeightedSoftIoULoss(alpha=alpha, sigma=beta)
+    elif loss_name == 'distance_weighted_soft_iou_small_exclude':
+        return DistanceWeightedSoftIoULossSmallExclude(alpha=alpha, sigma=beta, min_defect_size=1300)
     else:
         return nn.BCELoss()
 #Sigmoid versions (old):

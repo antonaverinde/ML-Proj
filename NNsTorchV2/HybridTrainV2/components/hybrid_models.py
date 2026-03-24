@@ -362,7 +362,273 @@ class BidirectionalWaveNetEncoder(nn.Module):
         x        = self.output_head(skip_sum)    # (B*H*W, 64)
         x        = self.head(x)                  # (B*H*W, 1)
         return x.reshape(B, 1, H, W)
+#--------------------------------------------
+#SimpleUnet
+def _conv_bn_relu(in_ch: int, out_ch: int, kernel: int = 3) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel, padding=kernel // 2, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True))
 
+
+def _conv_block(in_ch: int, out_ch: int, dropout_rate: float = 0.0) -> nn.Sequential:
+    """Double conv-BN-ReLU with optional spatial dropout after each conv."""
+    layers: list[nn.Module] = [
+        *_conv_bn_relu(in_ch, out_ch),
+    ]
+    if dropout_rate > 0:
+        layers.append(nn.Dropout2d(dropout_rate))
+    layers += [
+        *_conv_bn_relu(out_ch, out_ch),
+    ]
+    if dropout_rate > 0:
+        layers.append(nn.Dropout2d(dropout_rate))
+    return nn.Sequential(*layers)
+
+
+class SimplerUNet(nn.Module):
+    """
+    Three-level UNet encoder–decoder with skip connections.
+
+    Input  : (in_channels, H, W)
+    Output : raw logit  (1, H, W)   — use BCEWithLogitsLoss / Focal
+    """
+
+    def __init__(self, in_channels: int = 76, dropout_rate: float = 0.0):
+        super().__init__()
+        # Encoder
+        self.enc1 = _conv_block(in_channels, 32,  dropout_rate)
+        self.enc2 = _conv_block(32,          64,  dropout_rate)
+        self.enc3 = _conv_block(64,          128, dropout_rate)   # bottleneck
+
+        # Decoder
+        self.up1  = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec1 = _conv_block(128, 64, dropout_rate)   # 64 up + 64 skip
+
+        self.up2  = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = _conv_block(64, 32, dropout_rate)    # 32 up + 32 skip
+
+        self.pool = nn.MaxPool2d(2)
+        self.out  = nn.Conv2d(32, 1, 1)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        # Class-imbalance prior: sigmoid(-2.2) ≈ 0.10
+        nn.init.constant_(self.out.bias, -2.2)
+
+    @staticmethod
+    def _crop(skip: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Center-crop skip to match target's H×W (handles odd-size pooling)."""
+        _, _, H, W = target.shape
+        return skip[:, :, :H, :W]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H_in, W_in = x.shape[2], x.shape[3]
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+
+        u1 = self.up1(e3)
+        d1 = self.dec1(torch.cat([u1, self._crop(e2, u1)], dim=1))
+        u2 = self.up2(d1)
+        d2 = self.dec2(torch.cat([u2, self._crop(e1, u2)], dim=1))
+        out = self.out(d2)
+        # Pad back to original input size (handles odd H/W after pooling)
+        pad_h = H_in - out.shape[2]
+        pad_w = W_in - out.shape[3]
+        if pad_h > 0 or pad_w > 0:
+            out = F.pad(out, (0, pad_w, 0, pad_h))
+        return out
+#---------------------------------------------
+#Unet with SE and skip connections
+class UNetSE(nn.Module):
+    """
+    SimplerUNet + SE channel attention after every conv block.
+
+    Input  : (in_channels, H, W)
+    Output : raw logit  (1, H, W)
+    """
+
+    def __init__(self, in_channels: int = 76, dropout_rate: float = 0.0,
+                 se_reduction: int = 8):
+        super().__init__()
+        # Encoder (conv block → SE)
+        self.enc1 = nn.Sequential(_conv_block(in_channels, 32, dropout_rate),
+                                   SEBlock(32, se_reduction))
+        self.enc2 = nn.Sequential(_conv_block(32, 64, dropout_rate),
+                                   SEBlock(64, se_reduction))
+        self.enc3 = nn.Sequential(_conv_block(64, 128, dropout_rate),
+                                   SEBlock(128, se_reduction))
+
+        # Decoder (conv block → SE)
+        self.up1  = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec1 = nn.Sequential(_conv_block(128, 64, dropout_rate),
+                                   SEBlock(64, se_reduction))
+
+        self.up2  = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = nn.Sequential(_conv_block(64, 32, dropout_rate),
+                                   SEBlock(32, se_reduction))
+
+        self.pool = nn.MaxPool2d(2)
+        self.out  = nn.Conv2d(32, 1, 1)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        nn.init.constant_(self.out.bias, -2.2)
+
+    @staticmethod
+    def _crop(skip: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = target.shape
+        return skip[:, :, :H, :W]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H_in, W_in = x.shape[2], x.shape[3]
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+
+        u1 = self.up1(e3)
+        d1 = self.dec1(torch.cat([u1, self._crop(e2, u1)], dim=1))
+        u2 = self.up2(d1)
+        d2 = self.dec2(torch.cat([u2, self._crop(e1, u2)], dim=1))
+        out = self.out(d2)
+        pad_h = H_in - out.shape[2]
+        pad_w = W_in - out.shape[3]
+        if pad_h > 0 or pad_w > 0:
+            out = F.pad(out, (0, pad_w, 0, pad_h))
+        return out
+#---------------------------------------------
+#Branched CNN
+def _conv_bn_relu_k(in_ch: int, out_ch: int, kernel: int,
+                    dilation: int = 1) -> nn.Sequential:
+    pad = dilation * (kernel // 2)
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel, padding=pad,
+                  dilation=dilation, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True))
+
+
+class LocalSignalCNN(nn.Module):
+    """
+    Multi-scale CNN for localised physical signal detection (IR thermography).
+
+    Design rationale
+    ----------------
+    - No kernel > 5×5 in any single layer; defects are compact.
+    - Dilated 3×3 convolutions expand receptive field without large kernels,
+      capturing thermal diffusion halos (dilation=2 → 5×5 RF, dilation=4 → 9×9 RF).
+    - Spatial pyramid at the bottleneck fuses three RF scales before decoding.
+    - Stride-2 conv (not max-pool) for downsampling — preserves gradient flow
+      and avoids aliasing on weak thermal signals.
+    - No global average pooling — preserves spatial detail throughout.
+    - Two decoder levels restore 4× downsampled resolution.
+
+    Input  : (in_channels, H, W)   e.g. (76, 300, 300)
+    Output : raw logit  (1, H, W)  — use BCEWithLogitsLoss / Focal
+    """
+
+    def __init__(self, in_channels: int = 76, base: int = 32,
+                 dropout_rate: float = 0.0):
+        super().__init__()
+        b = base  # 32 by default
+
+        # ── Stage 1: stem (full resolution) ──────────────────────────
+        # Two 3×3 convs; capture sharp edges / hot-spots at native scale
+        self.stem = nn.Sequential(
+            _conv_bn_relu_k(in_channels, b,     3),
+            _conv_bn_relu_k(b,           b,     3),
+        )
+
+        # ── Stage 2: downsample ×2  (stride-2 conv) ──────────────────
+        self.down1 = _conv_bn_relu_k(b, b * 2, 3)   # stride via next line
+        self.pool1 = nn.Conv2d(b * 2, b * 2, 2, stride=2, bias=False)
+
+        # ── Stage 3: multi-scale local feature extraction ─────────────
+        # Three parallel branches — narrow / medium / diffusion-halo RF
+        # All work on the same H/2 × W/2 feature map
+        self.branch_sharp  = _conv_bn_relu_k(b * 2, b,     3, dilation=1)  # RF ≈ 5 px
+        self.branch_mid    = _conv_bn_relu_k(b * 2, b,     3, dilation=2)  # RF ≈ 9 px
+        self.branch_halo   = _conv_bn_relu_k(b * 2, b,     3, dilation=4)  # RF ≈ 17 px
+        # Merge branches + residual from stage 2
+        self.merge = nn.Sequential(
+            _conv_bn_relu_k(b * 3 + b * 2, b * 2, 1),   # channel compression
+            _conv_bn_relu_k(b * 2,          b * 2, 3),   # spatial mix
+        )
+        if dropout_rate > 0:
+            self.drop = nn.Dropout2d(dropout_rate)
+        else:
+            self.drop = nn.Identity()
+
+        # ── Stage 4: downsample ×2 again ─────────────────────────────
+        self.down2 = nn.Sequential(
+            nn.Conv2d(b * 2, b * 4, 2, stride=2, bias=False),
+            nn.BatchNorm2d(b * 4),
+            nn.ReLU(inplace=True),
+        )
+        self.bottleneck = _conv_bn_relu_k(b * 4, b * 4, 3)
+
+        # ── Decoder ──────────────────────────────────────────────────
+        self.up1  = nn.ConvTranspose2d(b * 4, b * 2, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            _conv_bn_relu_k(b * 4, b * 2, 3),   # merged + skip from stage 3
+            _conv_bn_relu_k(b * 2, b * 2, 3),
+        )
+        self.up2  = nn.ConvTranspose2d(b * 2, b, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            _conv_bn_relu_k(b * 2, b, 3),        # up + skip from stem
+            _conv_bn_relu_k(b,     b, 3),
+        )
+        self.out  = nn.Conv2d(b, 1, 1)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        nn.init.constant_(self.out.bias, -2.2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder
+        s1 = self.stem(x)                                        # (B, b,   H,   W)
+        x  = self.pool1(self.down1(s1))                          # (B, 2b,  H/2, W/2)
+        s3 = self.merge(torch.cat([                              # (B, 2b,  H/2, W/2)
+            self.branch_sharp(x),
+            self.branch_mid(x),
+            self.branch_halo(x),
+            x,                                                   # residual
+        ], dim=1))
+        s3 = self.drop(s3)
+        x  = self.bottleneck(self.down2(s3))                     # (B, 4b,  H/4, W/4)
+
+        # Decoder
+        x  = self.dec1(torch.cat([self.up1(x), s3], dim=1))     # (B, 2b,  H/2, W/2)
+        x  = self.dec2(torch.cat([self.up2(x), s1], dim=1))     # (B, b,   H,   W)
+        return self.out(x)
 
 
 
@@ -392,7 +658,10 @@ _MODEL_REGISTRY = {
     'cnn_skip': RefinementCNNSkip,
     'mlp':      RefinementMLP,
     'tcn':      TCNEncoder,
-    'wavenet':  BidirectionalWaveNetEncoder
+    'wavenet':  BidirectionalWaveNetEncoder,
+    'unet':     SimplerUNet,
+    'unet_se':  UNetSE,
+    'local_cnn': LocalSignalCNN,
 }
 
 
@@ -422,5 +691,9 @@ def build_hybrid_model(
     elif cls is BidirectionalWaveNetEncoder:
         return cls(in_ch=1, residual_ch=n_filters, T=in_ch) 
     elif cls is TCNEncoder:
-        return cls(in_ch=1, hidden=n_filters)   # already correct, no T needed        # MLP uses fixed hidden=(64,32,32), no n_filters
+        return cls(in_ch=1, hidden=n_filters)
+    elif cls in (SimplerUNet, UNetSE):
+        return cls(in_channels=in_ch)
+    elif cls is LocalSignalCNN:
+        return cls(in_channels=in_ch, base=n_filters)
     return cls(in_ch, n_filters=n_filters)

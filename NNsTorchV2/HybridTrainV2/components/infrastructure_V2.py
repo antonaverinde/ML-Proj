@@ -1,7 +1,6 @@
 """
-Training infrastructure — directories, MLflow, sample discovery, input-shape.
-
-Isolated here so that hybrid_manager.py only handles the training loop logic.
+V2 Training infrastructure — directories, MLflow, sample discovery, input-shape.
+Reads from HDF5 files via data_discovery_V2 / data_loading_V2.
 """
 
 import os
@@ -18,12 +17,12 @@ except ImportError:
     print("[WARNING] MLflow not installed — logging disabled")
 
 from ...core.config_paths import set_load_path
-from ...core.data_discovery import discover_samples, discover_data_files_for_location
-from ...core.data_loading import calculate_total_channels
+from ...core.data_discovery_V2 import discover_samples, discover_data_files_for_location
+from ...core.data_loading_V2 import calculate_total_channels
 
 
 class TrainingInfrastructure:
-    """Handles directories, MLflow experiment, sample discovery, and input-shape."""
+    """V2: Handles directories, MLflow, sample discovery, and input-shape (H5 source)."""
 
     def __init__(
         self,
@@ -62,10 +61,7 @@ class TrainingInfrastructure:
         self.ckpt_dir: str       = ''
         self.model_save_loc: str = ''
 
-    # ── Directories ───────────────────────────────────────────────────────────
-
     def setup_directories(self) -> Tuple[str, str, str]:
-        """Create versioned model/checkpoint dirs.  Returns (versioned_name, ckpt_dir, model_save_loc)."""
         model_dir_base = os.path.join(self.base_path, 'models', self.model_name)
         version_num, model_dir = 0, model_dir_base
         while os.path.exists(model_dir) and os.listdir(model_dir):
@@ -81,10 +77,7 @@ class TrainingInfrastructure:
         print(f"Output directory: {versioned_name}")
         return versioned_name, self.ckpt_dir, self.model_save_loc
 
-    # ── MLflow ────────────────────────────────────────────────────────────────
-
     def setup_mlflow(self) -> None:
-        """Configure MLflow tracking URI and experiment."""
         if not HAS_MLFLOW:
             return
         mlflow.set_tracking_uri(self.mlflow_uri)
@@ -92,73 +85,60 @@ class TrainingInfrastructure:
         print(f"MLflow tracking: {self.mlflow_uri}")
 
     def start_run(self, run_name: str) -> None:
-        """Start an MLflow run."""
         if HAS_MLFLOW:
             mlflow.start_run(run_name=run_name)
 
     def end_run(self) -> None:
-        """End the current MLflow run."""
         if HAS_MLFLOW:
             mlflow.end_run()
 
     def log_params(self, params: dict) -> None:
-        """Log a dict of hyperparameters to MLflow."""
         if HAS_MLFLOW:
             mlflow.log_params(params)
 
     def log_metrics(self, metrics: dict, step: int) -> None:
-        """Log a dict of metrics to MLflow at the given step."""
         if HAS_MLFLOW:
             mlflow.log_metrics(metrics, step=step)
 
-    # ── Sample discovery ──────────────────────────────────────────────────────
-
-    def discover_samples(self) -> List[Tuple[str, int]]:
-        """Discover all (sample_name, location_idx) pairs in the dataset."""
+    def discover_samples(self) -> List[Tuple[str, str]]:
+        """Discover all (sample_name, location_name) pairs (both strings in V2)."""
         return discover_samples(
             self.load_path, self.power_mode,
             mask_type=self.mask_type, dirs=self.dirs,
             data_regime=self.data_regime,
             max_locations=self.max_locations)
 
-    # ── Input shape ───────────────────────────────────────────────────────────
-
     def determine_input_shape(
-        self, samples: List[Tuple[str, int]]
+        self, samples: List[Tuple[str, str]]
     ) -> Tuple[int, Tuple[int, int, int], list]:
-        """Compute CNN input channels and spatial patch size from samples.
-
-        For full_padding: auto-computes min(H, W) and updates self.patch_size.
-        Returns (n_raw_ch, input_shape (C, H, W), patch_size [H, W]).
-        """
+        """Compute CNN input channels and spatial patch size from samples."""
         if not samples:
             raise ValueError("No valid samples found!")
 
-        sample, loc = samples[0]
-        sample_dir = os.path.join(self.load_path, self.power_mode, sample)
+        sample, loc_name = samples[0]
         fi = discover_data_files_for_location(
-            sample_dir, loc, self.mask_type, self.data_regime)
+            self.load_path, self.power_mode, sample, loc_name,
+            self.mask_type, self.data_regime)
         n_raw_ch = calculate_total_channels(
             fi, ppt_phases=self.ppt_phases,
             ppt_amps=self.ppt_amps, data_regime=self.data_regime)
 
-        # CNN input channels depend on mode
         if self.mode == 'prob_only':
             n_ch = 1
         elif self.mode == 'prob_feat':
             n_ch = n_raw_ch + 1
-        else:  # 'parallel' or 'nn_only'
+        else:
             n_ch = n_raw_ch
 
-        # Spatial size
         if self.patch_mode == 'full_padding':
             min_h = min_w = float('inf')
             for s, l in samples:
-                sd  = os.path.join(self.load_path, self.power_mode, s)
-                fi2 = discover_data_files_for_location(sd, l, self.mask_type, self.data_regime)
-                mask = np.load(fi2['mask'])
-                min_h = min(min_h, mask.shape[0])
-                min_w = min(min_w, mask.shape[1])
+                fi2 = discover_data_files_for_location(
+                    self.load_path, self.power_mode, s, l,
+                    self.mask_type, self.data_regime)
+                h, w = fi2['shape']   # use cached shape — no extra H5 open
+                min_h = min(min_h, h)
+                min_w = min(min_w, w)
             self.patch_size = [int(min_h), int(min_w)]
             H, W = int(min_h), int(min_w)
             print(f"Auto patch_size (min H/W): {self.patch_size}")

@@ -1,24 +1,26 @@
 """
-HybridTrainingManager — thin orchestrator for k-fold XGBoost+CNN hybrid training.
+HybridTrainingManager V2 — identical training logic, H5 data source.
 
-Wires together:
-  TrainingInfrastructure  (dirs, MLflow, sample discovery, input-shape)
-  make_strategy           (mode-specific forward/loss routing)
-  train_epoch / validate  (stateless epoch loops)
-  find_best_threshold     (IoU-maximising threshold search)
-  validate_final          (post-threshold final metrics)
+Switch from V1 to V2 with one import line:
+    from NNsTorchV2.HybridTrainV2.hybrid_manager_V2 import HybridTrainingManager
+
+Also set subfolder_name='Taris/Data_ML_V1_h5' in the constructor.
 """
 
 import gc
 import os
 from collections import Counter
+from sched import scheduler
 from typing import Callable, List, Optional, Tuple, Union
 
+import h5py
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam, AdamW, NAdam, RMSprop
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR, StepLR, ReduceLROnPlateau, OneCycleLR, LambdaLR
+)
 from sklearn.model_selection import StratifiedKFold
 
 try:
@@ -26,24 +28,24 @@ try:
 except ImportError:
     joblib = None
 
-from ..core.data_discovery import discover_data_files_for_location
-from ..core.data_loading import load_and_aggregate_location
+from ..core.data_discovery_V2 import discover_data_files_for_location
+from ..core.data_loading_V2 import load_and_aggregate_location
 from ..core.losses import get_loss_function
 from ..core.callbacks import MemoryCleanupCallback
 
-from .components.hybrid_utils import create_hybrid_dataloader
+from .components.hybrid_utils_V2 import create_hybrid_dataloader
 from .components.hybrid_models import FusionWeight
 from .components.forward_strategies import make_strategy
 from .components.epoch_runner import train_epoch, validate
 from .components.threshold_tuner import find_best_threshold
-from .components.infrastructure import TrainingInfrastructure
+from .components.infrastructure_V2 import TrainingInfrastructure
 from .components.warm_start import setup_warmstart, maybe_transition_phase2
 
 VALID_MODES = ('prob_only', 'prob_feat', 'parallel', 'nn_only')
 
 
 class HybridTrainingManager:
-    """K-fold training manager for Hybrid XGBoost+CNN models with MLflow logging."""
+    """K-fold training manager for Hybrid XGBoost+CNN models with H5 data source."""
 
     def __init__(
         self,
@@ -52,12 +54,13 @@ class HybridTrainingManager:
         mode: str,
         xgb_model_path: Optional[str] = None,
         power_mode: str = '4kw_both',
-        subfolder_name: str = 'Taris/Data_ML_V3',
+        subfolder_name: str = 'Taris/Data_ML_V1_h5',   # V2: changed from 'Taris/Data_ML_V3'
         patch_size: tuple = (128, 128),
         initial_lr: float = 1e-3,
         drop: float = 0.5,
         epochs_drop: int = 10,
         optimizer_name: str = 'adam',
+        scheduler_name: str = 'cosine',
         loss_name: str = 'tversky',
         alpha: float = 0.65,
         beta: float = 0.35,
@@ -81,9 +84,10 @@ class HybridTrainingManager:
         combine: str = 'mean',
         fusion_freeze_epochs: int = 5,
         init_w: float = 0.0,
-        dataset_n="V1",
+        dataset_n: str = "V1",
         max_locations: Optional[int] = None,
         min_mask_area: int = 0,
+        warmup_epochs: int = 3,
     ):
         assert mode in VALID_MODES, f"mode must be one of {VALID_MODES}, got {mode!r}"
         if mode != 'nn_only':
@@ -98,6 +102,7 @@ class HybridTrainingManager:
         self.drop                = drop
         self.epochs_drop         = epochs_drop
         self.optimizer_name      = optimizer_name.lower()
+        self.scheduler_name      = scheduler_name.lower()
         self.loss_name           = loss_name.lower()
         self.alpha               = alpha
         self.beta                = beta
@@ -124,6 +129,7 @@ class HybridTrainingManager:
         self.dataset_n = dataset_n
         self.max_locations = max_locations
         self.min_mask_area = min_mask_area
+        self.warmup_epochs = warmup_epochs  # For cosine_warmup scheduler
         print(f"Device: {self.device}  |  mode: {mode}  |  patch_mode: {patch_mode}")
 
         if mode != 'nn_only':
@@ -132,7 +138,6 @@ class HybridTrainingManager:
         else:
             self.xgb_global = None
 
-        # Infrastructure: dirs + MLflow + samples + input shape
         self.infra = TrainingInfrastructure(
             model_name=model_name, sys=sys, mode=mode,
             subfolder_name=subfolder_name, power_mode=power_mode,
@@ -146,7 +151,6 @@ class HybridTrainingManager:
         self.infra.setup_directories()
         self.infra.setup_mlflow()
 
-        # Expose attributes the notebook and downstream code expect
         self.versioned_name  = self.infra.versioned_name
         self.ckpt_dir        = self.infra.ckpt_dir
         self.model_save_loc  = self.infra.model_save_loc
@@ -162,17 +166,14 @@ class HybridTrainingManager:
         if self.comp_weights:
             self.pos_w, self.neg_w = self.compute_weights()
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
     def compute_weights(self) -> Tuple[float, float]:
         """Compute positive/negative pixel class weights from all samples."""
         pos = neg = 0
-        for sample_name, location_idx in self.all_samples:
-            sample_dir = os.path.join(self.load_path, self.power_mode, sample_name)
+        for sample_name, location_name in self.all_samples:
             fi = discover_data_files_for_location(
-                sample_dir, location_idx, self.mask_type,
-                data_regime=self.data_regime)
-            mask, _ = load_and_aggregate_location(
+                self.load_path, self.power_mode, sample_name, location_name,
+                self.mask_type, data_regime=self.data_regime)
+            _, mask = load_and_aggregate_location(
                 fi, invert_mask=False, mask_only=True,
                 data_regime=self.data_regime, min_mask_area=self.min_mask_area)
             pos += (mask > 0).sum()
@@ -182,14 +183,12 @@ class HybridTrainingManager:
         return pw, 1.0
 
     def get_loss(self) -> nn.Module:
-        """Instantiate the configured loss function."""
         return get_loss_function(self.loss_name, self.pos_w, self.neg_w,
                                  self.alpha, self.beta)
 
     def get_optimizer(
         self, model: nn.Module, fusion: Optional[FusionWeight] = None
     ) -> torch.optim.Optimizer:
-        """Build optimizer.  Parallel mode gives fusion its own param group at LR/10."""
         opt_cls = {'adam': Adam, 'adamw': AdamW,
                    'rmsprop': RMSprop, 'nadam': NAdam}.get(self.optimizer_name, Adam)
         if fusion is not None:
@@ -201,8 +200,45 @@ class HybridTrainingManager:
             params = [{'params': model.parameters(), 'lr': self.initial_lr}]
         return opt_cls(params, weight_decay=self.weight_decay)
 
+    def get_scheduler(
+        self, optimizer: torch.optim.Optimizer, T_max: int
+    ) -> torch.optim.lr_scheduler.LRScheduler:
+        """Build a learning-rate scheduler by name."""
+        name = self.scheduler_name
+        if name == 'cosine':
+            return CosineAnnealingLR(optimizer, T_max=T_max,
+                                     eta_min=self.initial_lr * 0.001)
+        if name == 'step':
+            return StepLR(optimizer, step_size=max(1, T_max // 3), gamma=0.5)
+        if name == 'plateau':
+            return ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+        if name == 'onecycle':
+            return OneCycleLR(optimizer, max_lr=self.initial_lr,
+                              epochs=T_max, steps_per_epoch=1)
+        if name == 'none':
+            return LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+        if name == 'cosine_warmup':
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, 
+                start_factor=0.1,     # 1e-3 → 1e-2 over 3 epochs
+                end_factor=1.0, 
+                total_iters=self.warmup_epochs
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=T_max-self.warmup_epochs,
+                eta_min=1e-5           # end at 1e-5, not 1e-4
+            )
+            return  torch.optim.lr_scheduler.SequentialLR(
+    optimizer,
+    schedulers=[warmup_scheduler, cosine_scheduler],
+    milestones=[self.warmup_epochs]
+)
+
+        raise ValueError(f"Unknown scheduler_name={name!r}. "
+                         "Choose: cosine | step | plateau | onecycle | none")
+
     def save_fold_split(self, train_samples, val_samples, fold: int) -> None:
-        """Persist train/val sample split for reproducibility."""
         fold_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), 'fold_splits', self.model_name)
         os.makedirs(fold_dir, exist_ok=True)
@@ -214,7 +250,6 @@ class HybridTrainingManager:
         self, model, optimizer, scheduler, epoch: int, fold: int,
         fusion: Optional[FusionWeight] = None, is_best: bool = False
     ) -> None:
-        """Save training checkpoint to ckpt_dir."""
         ckpt = dict(epoch=epoch, fold=fold,
                     model_state_dict=model.state_dict(),
                     optimizer_state_dict=optimizer.state_dict(),
@@ -224,8 +259,6 @@ class HybridTrainingManager:
         torch.save(ckpt, os.path.join(self.ckpt_dir, f'fold{fold}_ep{epoch:02d}.pt'))
         if is_best:
             torch.save(ckpt, os.path.join(self.ckpt_dir, f'fold{fold}_best.pt'))
-
-    # ── K-fold loop ───────────────────────────────────────────────────────────
 
     def run_kfold(
         self,
@@ -247,11 +280,10 @@ class HybridTrainingManager:
 
         all_samples = np.array(self.all_samples, dtype=object)
         classes = []
-        for name, loc in all_samples:
-            sample_dir = os.path.join(self.load_path, self.power_mode, name)
+        for name, loc_name in all_samples:
             fi = discover_data_files_for_location(
-                sample_dir, loc, mask_type=self.mask_type,
-                data_regime=self.data_regime)
+                self.load_path, self.power_mode, name, loc_name,
+                mask_type=self.mask_type, data_regime=self.data_regime)
             _, mask = load_and_aggregate_location(
                 fi, invert_mask=self.invert_mask, mask_only=True,
                 data_regime=self.data_regime,
@@ -305,13 +337,11 @@ class HybridTrainingManager:
 
                 model = model_fn().to(self.device)
 
-                # Warm-start: maybe load checkpoint + phase-1 head-only optimizer
                 _phase1_active, _phase1_opt = setup_warmstart(
                     model, warmstart_ckpt_paths, f + 1, self.device,
                     head_freeze_epochs, head_lr,
                     self.optimizer_name, self.weight_decay)
 
-                # Build fusion weight and strategy — parallel mode only
                 if self.mode == 'parallel':
                     fusion = FusionWeight(init_logit=self.init_w).to(self.device)
                     if self.fusion_freeze_epochs > 0:
@@ -327,8 +357,7 @@ class HybridTrainingManager:
                     optimizer = self.get_optimizer(model)
 
                 strategy  = make_strategy(self.mode, fusion=fusion, combine=self.combine)
-                scheduler = CosineAnnealingLR(optimizer, T_max=epochs,
-                                              eta_min=self.initial_lr * 0.001)
+                scheduler = self.get_scheduler(optimizer, epochs)
                 criterion = self.get_loss()
                 memory_cb = MemoryCleanupCallback()
 
@@ -336,14 +365,13 @@ class HybridTrainingManager:
                 best_state, best_fusion_state = None, None
 
                 for epoch in range(epochs):
-                    # Phase 2 transition: unfreeze all layers after head-only warmup
                     _phase1_active, new_opt, new_sched = maybe_transition_phase2(
                         epoch, head_freeze_epochs, _phase1_active, model,
-                        self.get_optimizer, epochs - head_freeze_epochs, self.initial_lr)
+                        self.get_optimizer, epochs - head_freeze_epochs, self.initial_lr,
+                        self.get_scheduler)
                     if new_opt is not None:
                         optimizer, scheduler = new_opt, new_sched
 
-                    # Unfreeze fusion weight after warmup
                     if (fusion is not None
                             and epoch == self.fusion_freeze_epochs
                             and not fusion.logit_w.requires_grad):
@@ -354,7 +382,10 @@ class HybridTrainingManager:
                     tr = train_epoch(model, train_loader, criterion, optimizer,
                                      strategy, self.device)
                     va = validate(model, val_loader, criterion, strategy, self.device)
-                    scheduler.step()
+                    if isinstance(scheduler, ReduceLROnPlateau):
+                        scheduler.step(va[0])
+                    else:
+                        scheduler.step()
                     lr = optimizer.param_groups[0]['lr']
 
                     step = f * epochs + epoch
@@ -393,7 +424,6 @@ class HybridTrainingManager:
                         print(f"  Early stop at epoch {epoch+1}")
                         break
 
-                # Restore best weights
                 if self.restore_best and best_state:
                     model.load_state_dict(best_state)
                     if fusion is not None and best_fusion_state is not None:

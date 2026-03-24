@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environment
+.env
+.venv/
+venv/
+
+# Large model/data files
+*.pt
+*.npy
+*.npz
+*.joblib
+*.h5
+*.hdf5
+*.db
+
+# Training outputs
+checkpoints/
+models/
+fold_splits/
+mlruns/
+
+# IDE
+.idea/
+.vscode/
+*.swp

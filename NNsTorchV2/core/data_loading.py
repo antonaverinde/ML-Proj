@@ -17,7 +17,8 @@ def load_and_aggregate_location(
     ppt_amps: int = 6,
     invert_mask: bool = False,
     mask_only: bool = False,
-    data_regime: str = 'postprocessed'
+    data_regime: str = 'postprocessed',
+    min_mask_area: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load and aggregate all data for a single location with dynamic file discovery.
@@ -36,6 +37,13 @@ def load_and_aggregate_location(
     """
     # Load mask
     mask = np.load(files_info['mask'])
+    if min_mask_area > 0:
+        from scipy import ndimage
+        labeled, _ = ndimage.label(mask > 0)
+        sizes = np.bincount(labeled.ravel())
+        keep = sizes >= min_mask_area
+        keep[0] = False  # background (label 0) must always map to 0
+        mask = keep[labeled].astype(mask.dtype)
     H, W = mask.shape
 
     if invert_mask:

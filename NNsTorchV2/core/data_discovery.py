@@ -150,7 +150,8 @@ def discover_samples(
     power_mode: str,
     dirs: List[int],
     mask_type: str = 'normal',
-    data_regime: str = 'postprocessed'
+    data_regime: str = 'postprocessed',
+    max_locations: Optional[int] = None,
 ) -> List[Tuple[str, int]]:
     """
     Discover all available (sample, location) pairs in the dataset.
@@ -254,5 +255,13 @@ def discover_samples(
                 samples.append((sample_name, location_idx))
             else:
                 print(f"[WARNING] Skipping {sample_name}, location {location_idx} due to corrupted files")
+
+    if max_locations is not None:
+        unique_locs = []
+        for _, loc in samples:
+            if loc not in unique_locs:
+                unique_locs.append(loc)      # preserve discovery order, deduplicate
+        keep = set(unique_locs[:max_locations])
+        samples = [(s, l) for s, l in samples if l in keep]
 
     return samples

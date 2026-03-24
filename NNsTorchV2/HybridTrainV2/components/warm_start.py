@@ -82,6 +82,7 @@ def maybe_transition_phase2(
     get_optimizer_fn: Callable[[nn.Module], torch.optim.Optimizer],
     remaining_epochs: int,
     initial_lr: float,
+    get_scheduler_fn=None,
 ) -> Tuple[bool, Optional[torch.optim.Optimizer], Optional[CosineAnnealingLR]]:
     """At the phase boundary, unfreeze all layers and rebuild optimizer/scheduler.
 
@@ -93,8 +94,11 @@ def maybe_transition_phase2(
 
     unfreeze_all(model)
     optimizer = get_optimizer_fn(model)
-    scheduler = CosineAnnealingLR(
-        optimizer, T_max=max(1, remaining_epochs), eta_min=initial_lr * 0.001)
+    if get_scheduler_fn is not None:
+        scheduler = get_scheduler_fn(optimizer, max(1, remaining_epochs))
+    else:
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=max(1, remaining_epochs), eta_min=initial_lr * 0.001)
     print(f"  Epoch {epoch + 1}: Phase 2 — all layers unfrozen "
           f"(lr={initial_lr:.1e})")
     return False, optimizer, scheduler
