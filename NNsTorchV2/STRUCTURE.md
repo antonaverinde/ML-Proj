@@ -80,7 +80,6 @@ HybridTrainV2/
 ├── hybrid_manager_V2.py     # V2/HDF5 HybridTrainingManager
 ├── NNs/                     # Neural-network training/evaluation notebooks
 │   ├── HybridTraining.ipynb
-│   ├── ConHybridTraining.ipynb
 │   └── ModelEvaluation.ipynb
 ├── MLs/                     # Classical ML training notebooks
 │   └── MLTraining.ipynb
@@ -156,7 +155,7 @@ manager.run()                          # Executes full k-fold training loop
 
 ### Warm-start two-phase strategy (`warm_start.py`)
 
-Used by `ConHybridTraining.ipynb` to fine-tune a `parallel`-mode checkpoint in `nn_only` mode.
+Available for warm-start fine-tuning from a previous `parallel`-mode checkpoint into `nn_only` mode.
 
 | Phase | Layers trained | LR | Trigger |
 |---|---|---|---|
@@ -183,7 +182,6 @@ phase1_active, optimizer, scheduler = maybe_transition_phase2(
 | Notebook | Purpose |
 |---|---|
 | `NNs/HybridTraining.ipynb` | Standard entry point — configure mode/loss/data, call `manager.run_kfold()`. Includes optional inference check cell. Saves checkpoints to `checkpoints/<model_name>/<timestamp>/fold{N}_best.pt`. |
-| `NNs/ConHybridTraining.ipynb` | Warm-start fine-tuning — loads `parallel`-mode checkpoints, switches to `nn_only` mode, runs two-phase training via `warmstart_ckpt_paths` + `head_freeze_epochs`/`head_lr` args to `run_kfold()`. |
 | `NNs/ModelEvaluation.ipynb` | Loads saved checkpoints and fold splits, then writes diagnostic plots/metrics under `ModelsEvaluationfolder/`. |
 | `MLs/MLTraining.ipynb` | Trains classical ML baselines against the same HDF5 data and optional NN fold splits. |
 | `GANs/GANUNETtrain.ipynb` | Trains fold-specific autoencoders and U-Net models on reconstruction differences. |
