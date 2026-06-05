@@ -2,28 +2,75 @@
 __pycache__/
 *.py[cod]
 *.so
+*.egg-info/
+.eggs/
+
+# Generated files
+*.png
+*.db
+*.h5
+*.hdf5
 
 # Environment
 .env
 .venv/
 venv/
 
-# Large model/data files
-*.pt
-*.npy
-*.npz
-*.joblib
-*.h5
-*.hdf5
-*.db
-
-# Training outputs
-checkpoints/
-models/
-fold_splits/
-mlruns/
-
 # IDE
 .idea/
 .vscode/
 *.swp
+
+# Data (too large for git)
+*.npy
+*.npz
+
+# Logs
+logs/
+mlruns/
+
+# Large model files
+Trees/Trees_database/
+NNsTorch/checkpoints/
+NNsTorch/models/
+NNsTorch/HybridTrainV2/checkpoints/
+NNsTorchV2/HybridTrainV2/checkpoints/
+NNsTorchV2/HybridTrainV2/GANs/checkpoints/
+NNsTorchV2/HybridTrainV2/GANs/fold_splits/
+NNsTorchV2/HybridTrainV2/fold_splits/
+NNsTorchV2/HybridTrainV2/ML_Models/
+NNsTorchV2/HybridTrainV2/ModelsEvaluationfolder/
+NNsTorchV2/HybridTrainV2/plots/
+NNsTorchV2/mlflow_backup_*/
+*.pt
+*.pth
+*.joblib
+.claude/settings.local.json
+BinaryMasks/.claude/settings.local.json
+BinaryMasks/Barrel_Images2/S5_Back.jpg
+BinaryMasks/Barrel_Images2/S5_Front.jpg
+BinaryMasks/Barrel_Images2/S6_Back.jpg
+BinaryMasks/Barrel_Images2/S6_Front.jpg
+BinaryMasks/Barrels_Images/Close_View/S0/Back.jpg
+BinaryMasks/Barrels_Images/Close_View/S0/Front.jpg
+BinaryMasks/Barrels_Images/Close_View/S1/Back.jpg
+BinaryMasks/Barrels_Images/Close_View/S1/Front.jpg
+BinaryMasks/Barrels_Images/Close_View/S2/Back.jpg
+BinaryMasks/Barrels_Images/Close_View/S2/Front.jpg
+BinaryMasks/Barrels_Images/Close_View/S3/Back.jpg
+BinaryMasks/Barrels_Images/Close_View/S3/Front.jpg
+BinaryMasks/Barrels_Images/Close_View/S4/Back.jpg
+BinaryMasks/Barrels_Images/Close_View/S4/Front.jpg
+BinaryMasks/Barrels_Images/Far_View/S0/Back.jpg
+BinaryMasks/Barrels_Images/Far_View/S0/Front.jpg
+BinaryMasks/Barrels_Images/Far_View/S1/Back.jpg
+BinaryMasks/Barrels_Images/Far_View/S1/Front.jpg
+BinaryMasks/Barrels_Images/Far_View/S2/Back.jpg
+BinaryMasks/Barrels_Images/Far_View/S2/Front.jpg
+BinaryMasks/Barrels_Images/Far_View/S3/Back.jpg
+BinaryMasks/Barrels_Images/Far_View/S3/Front.jpg
+BinaryMasks/Barrels_Images/Far_View/S4/Back.jpg
+BinaryMasks/Barrels_Images/Far_View/S4/Front.jpg
+Miniforge3-Linux-x86_64.sh
+.mcp.json
+fold_splits/

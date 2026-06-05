@@ -35,6 +35,8 @@ Pure utilities with no training logic. Used by `HybridTrainV2` and can be used s
 | `data_loading.py` | `load_and_aggregate_location()` — load and stack feature arrays for one (sample, location) |
 | `data_pipeline.py` | Eager data pipeline (loads all data into memory upfront) |
 | `data_pipeline_lazy.py` | Lazy data pipeline (loads per-batch; lower memory footprint) |
+| `data_discovery_V2.py` | HDF5 sample/file discovery for `Data_ML_V1_h5` |
+| `data_loading_V2.py` | HDF5 feature/mask loading with the V1 loader-style API |
 | `patch_extraction.py` | `extract_patches_from_image()` — sliding-window patch extraction |
 | `full_img_padding.py` | `extract_full_padding_patch()` — padded full-image patch extraction |
 | `losses.py` | Loss function registry — see table below |
@@ -74,18 +76,33 @@ K-fold hybrid XGBoost+CNN training with MLflow logging. Organised around a strat
 ```
 HybridTrainV2/
 ├── __init__.py              # Re-exports everything below
-├── hybrid_manager.py        # HybridTrainingManager (main entry point)
-├── HybridTraining.ipynb     # Main training notebook (standard k-fold run)
-├── ConHybridTraining.ipynb  # Continued training notebook (warm-start fine-tuning)
+├── hybrid_manager.py        # V1/NPZ HybridTrainingManager
+├── hybrid_manager_V2.py     # V2/HDF5 HybridTrainingManager
+├── NNs/                     # Neural-network training/evaluation notebooks
+│   ├── HybridTraining.ipynb
+│   ├── ConHybridTraining.ipynb
+│   └── ModelEvaluation.ipynb
+├── MLs/                     # Classical ML training notebooks
+│   └── MLTraining.ipynb
+├── GANs/                    # Autoencoder + U-Net training/evaluation pipeline
+│   ├── GANUNETtrain.ipynb
+│   ├── GANUNETEvaluation.ipynb
+│   ├── gan_unet_data.py
+│   ├── gan_unet_models.py
+│   └── gan_unet_trainer.py
 └── components/
     ├── hybrid_models.py     # CNN architectures + FusionWeight
     ├── hybrid_utils.py      # Dataset + DataLoader factory
+    ├── hybrid_utils_V2.py   # HDF5 Dataset + DataLoader factory
     ├── forward_strategies.py# Mode-specific forward/loss routing
     ├── epoch_runner.py      # Stateless train_epoch / validate / validate_final
     ├── threshold_tuner.py   # IoU-maximising threshold search
     ├── infrastructure.py    # TrainingInfrastructure (dirs, MLflow, data discovery)
+    ├── infrastructure_V2.py # HDF5 TrainingInfrastructure
     └── warm_start.py        # Two-phase warm-start: head-freeze → full fine-tune
 ```
+
+Generated outputs stay out of git: `checkpoints/`, `fold_splits/`, `mlruns/`, `plots/`, `ML_Models/`, `ModelsEvaluationfolder/`, `GANs/checkpoints/`, `GANs/fold_splits/`, `mlflow_backup_*`, model weights, split arrays, and image artifacts.
 
 ### Hybrid modes
 
@@ -165,8 +182,12 @@ phase1_active, optimizer, scheduler = maybe_transition_phase2(
 
 | Notebook | Purpose |
 |---|---|
-| `HybridTraining.ipynb` | Standard entry point — configure mode/loss/data, call `manager.run_kfold()`. Includes optional inference check cell. Saves checkpoints to `checkpoints/<model_name>/<timestamp>/fold{N}_best.pt`. |
-| `ConHybridTraining.ipynb` | Warm-start fine-tuning — loads `parallel`-mode checkpoints, switches to `nn_only` mode, runs two-phase training via `warmstart_ckpt_paths` + `head_freeze_epochs`/`head_lr` args to `run_kfold()`. |
+| `NNs/HybridTraining.ipynb` | Standard entry point — configure mode/loss/data, call `manager.run_kfold()`. Includes optional inference check cell. Saves checkpoints to `checkpoints/<model_name>/<timestamp>/fold{N}_best.pt`. |
+| `NNs/ConHybridTraining.ipynb` | Warm-start fine-tuning — loads `parallel`-mode checkpoints, switches to `nn_only` mode, runs two-phase training via `warmstart_ckpt_paths` + `head_freeze_epochs`/`head_lr` args to `run_kfold()`. |
+| `NNs/ModelEvaluation.ipynb` | Loads saved checkpoints and fold splits, then writes diagnostic plots/metrics under `ModelsEvaluationfolder/`. |
+| `MLs/MLTraining.ipynb` | Trains classical ML baselines against the same HDF5 data and optional NN fold splits. |
+| `GANs/GANUNETtrain.ipynb` | Trains fold-specific autoencoders and U-Net models on reconstruction differences. |
+| `GANs/GANUNETEvaluation.ipynb` | Evaluates the GAN/U-Net checkpoints, thresholds, and per-location diagnostics. |
 
 ---
 
@@ -174,9 +195,9 @@ phase1_active, optimizer, scheduler = maybe_transition_phase2(
 
 ```
 HybridTrainingManager
-    └── TrainingInfrastructure   ← core.data_discovery, core.config_paths
+    └── TrainingInfrastructure   ← core.data_discovery(_V2), core.config_paths
     └── make_strategy(mode)      ← forward_strategies → hybrid_models
-    └── train_epoch / validate   ← epoch_runner → HybridPatchDataset (hybrid_utils)
+    └── train_epoch / validate   ← epoch_runner → HybridPatchDataset (hybrid_utils/_V2)
     └── find_best_threshold      ← threshold_tuner
     └── get_loss_function        ← core.losses
     └── MemoryCleanupCallback    ← core.callbacks

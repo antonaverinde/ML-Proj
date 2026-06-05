@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as T
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 
 from ...core.data_discovery_V2 import discover_data_files_for_location
 from ...core.data_loading_V2 import load_and_aggregate_location
@@ -39,6 +41,7 @@ class HybridPatchDataset(Dataset):
         power_mode: str,
         patch_size: tuple = (128, 128),
         augment: bool = True,
+        rot_angle: float = 0.0,
         mask_type: str = 'alternative',
         ppt_phases: Union[str, int] = 'all',
         ppt_amps: int = 6,
@@ -50,6 +53,7 @@ class HybridPatchDataset(Dataset):
         min_mask_area: int = 0,
     ):
         self.transform = _spatial_transform if augment else None
+        self.max_rot_angle = rot_angle if augment else 0.0
         self.patches: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
         for sample_name, location_name in sample_indices:
@@ -117,6 +121,12 @@ class HybridPatchDataset(Dataset):
             torch.manual_seed(seed); xgb_t  = self.transform(xgb_t)
             torch.manual_seed(seed); mask_t = self.transform(mask_t)
 
+            if self.max_rot_angle > 0:
+                angle = (torch.rand(1).item() * 2 - 1) * self.max_rot_angle
+                data_t = TF.rotate(data_t, angle, interpolation=InterpolationMode.BILINEAR, fill=0)
+                xgb_t  = TF.rotate(xgb_t,  angle, interpolation=InterpolationMode.BILINEAR, fill=0)
+                mask_t = TF.rotate(mask_t, angle, interpolation=InterpolationMode.NEAREST,  fill=0)
+
         return data_t, xgb_t, mask_t.squeeze(0)
 
 
@@ -128,6 +138,7 @@ def create_hybrid_dataloader(
     patch_size: tuple = (128, 128),
     batch_size: int = 4,
     augment: bool = True,
+    rot_angle: float = 0.0,
     mask_type: str = 'alternative',
     shuffle: bool = True,
     num_workers: int = 4,
@@ -148,6 +159,7 @@ def create_hybrid_dataloader(
         power_mode=power_mode,
         patch_size=patch_size,
         augment=augment,
+        rot_angle=rot_angle,
         mask_type=mask_type,
         ppt_phases=ppt_phases,
         ppt_amps=ppt_amps,

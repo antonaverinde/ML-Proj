@@ -111,6 +111,11 @@ class TrainingInfrastructure:
         if HAS_MLFLOW:
             mlflow.log_metrics(metrics, step=step)
 
+    def log_artifact(self, local_path: str, artifact_path: str = None) -> None:
+        """Log a local file to the active MLflow run."""
+        if HAS_MLFLOW:
+            mlflow.log_artifact(local_path, artifact_path=artifact_path)
+
     # ── Sample discovery ──────────────────────────────────────────────────────
 
     def discover_samples(self) -> List[Tuple[str, int]]:

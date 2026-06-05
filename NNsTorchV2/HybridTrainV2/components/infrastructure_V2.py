@@ -6,6 +6,7 @@ Reads from HDF5 files via data_discovery_V2 / data_loading_V2.
 import os
 from datetime import datetime
 from typing import List, Optional, Tuple, Union
+import warnings
 
 import numpy as np
 
@@ -60,6 +61,7 @@ class TrainingInfrastructure:
         self.versioned_name: str = ''
         self.ckpt_dir: str       = ''
         self.model_save_loc: str = ''
+        self._mlflow_enabled = HAS_MLFLOW
 
     def setup_directories(self) -> Tuple[str, str, str]:
         model_dir_base = os.path.join(self.base_path, 'models', self.model_name)
@@ -78,27 +80,56 @@ class TrainingInfrastructure:
         return versioned_name, self.ckpt_dir, self.model_save_loc
 
     def setup_mlflow(self) -> None:
-        if not HAS_MLFLOW:
+        if not self._mlflow_enabled:
             return
-        mlflow.set_tracking_uri(self.mlflow_uri)
-        mlflow.set_experiment('HybridTrainV2')
-        print(f"MLflow tracking: {self.mlflow_uri}")
+        try:
+            mlflow.set_tracking_uri(self.mlflow_uri)
+            mlflow.set_registry_uri(self.mlflow_uri)
+            os.environ.setdefault("MLFLOW_REGISTRY_URI", self.mlflow_uri)
+            mlflow.set_experiment('HybridTrainV2')
+            print(f"MLflow tracking: {self.mlflow_uri}")
+        except Exception as exc:
+            self._disable_mlflow(exc, "setup")
+
+    def _disable_mlflow(self, exc: Exception, action: str) -> None:
+        self._mlflow_enabled = False
+        warnings.warn(f"MLflow {action} failed; continuing without MLflow logging: {exc}", RuntimeWarning)
 
     def start_run(self, run_name: str) -> None:
-        if HAS_MLFLOW:
-            mlflow.start_run(run_name=run_name)
+        if self._mlflow_enabled:
+            try:
+                mlflow.start_run(run_name=run_name)
+            except Exception as exc:
+                self._disable_mlflow(exc, "start_run")
 
     def end_run(self) -> None:
-        if HAS_MLFLOW:
-            mlflow.end_run()
+        if self._mlflow_enabled:
+            try:
+                mlflow.end_run()
+            except Exception as exc:
+                self._disable_mlflow(exc, "end_run")
 
     def log_params(self, params: dict) -> None:
-        if HAS_MLFLOW:
-            mlflow.log_params(params)
+        if self._mlflow_enabled:
+            try:
+                mlflow.log_params(params)
+            except Exception as exc:
+                self._disable_mlflow(exc, "log_params")
 
     def log_metrics(self, metrics: dict, step: int) -> None:
-        if HAS_MLFLOW:
-            mlflow.log_metrics(metrics, step=step)
+        if self._mlflow_enabled:
+            try:
+                mlflow.log_metrics(metrics, step=step)
+            except Exception as exc:
+                self._disable_mlflow(exc, "log_metrics")
+
+    def log_artifact(self, local_path: str, artifact_path: str = None) -> None:
+        """Log a local file to the active MLflow run."""
+        if self._mlflow_enabled:
+            try:
+                mlflow.log_artifact(local_path, artifact_path=artifact_path)
+            except Exception as exc:
+                self._disable_mlflow(exc, "log_artifact")
 
     def discover_samples(self) -> List[Tuple[str, str]]:
         """Discover all (sample_name, location_name) pairs (both strings in V2)."""

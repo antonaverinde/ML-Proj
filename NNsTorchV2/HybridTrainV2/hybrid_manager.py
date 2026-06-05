@@ -71,6 +71,7 @@ class HybridTrainingManager:
         apply_jitter: bool = True,
         mlflow_uri: str = os.environ.get('MLFLOW_TRACKING_URI', 'sqlite:////tmp/mlflow_experiments/mlflow.db'),
         augment: bool = True,
+        rot_angle: float = 0.0,
         min_positive_ratio: float = 0.05,
         patch_mode: str = 'full_padding',
         pos_w: float = 1.0,
@@ -110,6 +111,7 @@ class HybridTrainingManager:
         self.dirs                = dirs if dirs is not None else []
         self.apply_jitter        = apply_jitter
         self.augment             = augment
+        self.rot_angle           = rot_angle
         self.min_positive_ratio  = min_positive_ratio
         self.patch_mode          = patch_mode
         self.pos_w               = pos_w
@@ -202,13 +204,16 @@ class HybridTrainingManager:
         return opt_cls(params, weight_decay=self.weight_decay)
 
     def save_fold_split(self, train_samples, val_samples, fold: int) -> None:
-        """Persist train/val sample split for reproducibility."""
+        """Persist train/val sample split for reproducibility and log to MLflow."""
         fold_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'fold_splits', self.model_name)
+            os.path.dirname(os.path.abspath(__file__)), 'fold_splits',
+            self.versioned_name, os.path.basename(self.ckpt_dir))
         os.makedirs(fold_dir, exist_ok=True)
-        np.savez(os.path.join(fold_dir, f'fold_{fold}.npz'),
+        npz_path = os.path.join(fold_dir, f'fold_{fold}.npz')
+        np.savez(npz_path,
                  train_samples=np.array(train_samples, dtype=object),
                  val_samples=np.array(val_samples, dtype=object))
+        self.infra.log_artifact(npz_path, artifact_path='fold_splits')
 
     def save_checkpoint(
         self, model, optimizer, scheduler, epoch: int, fold: int,
@@ -296,8 +301,8 @@ class HybridTrainingManager:
                     data_regime=self.data_regime,
                     min_mask_area=self.min_mask_area)
                 train_loader = create_hybrid_dataloader(
-                    train_samples, augment=self.augment, shuffle=True,
-                    apply_jitter=self.apply_jitter,
+                    train_samples, augment=self.augment, rot_angle=self.rot_angle,
+                    shuffle=True, apply_jitter=self.apply_jitter,
                     min_positive_ratio=self.min_positive_ratio, **loader_kw)
                 val_loader = create_hybrid_dataloader(
                     val_samples, augment=False, shuffle=False,

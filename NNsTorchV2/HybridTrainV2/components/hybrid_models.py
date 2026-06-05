@@ -35,12 +35,13 @@ class RefinementCNN(nn.Module):
     Output : raw logit (1, H, W)
     """
 
-    def __init__(self, in_channels: int, n_filters: int = 32):
+    def __init__(self, in_channels: int, n_filters: int = 32, dropout_rate: float = 0.0):
         super().__init__()
+        drop = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
         self.net = nn.Sequential(
-            _conv_bn_relu(in_channels, n_filters),
-            _conv_bn_relu(n_filters, n_filters),
-            _conv_bn_relu(n_filters, n_filters // 2),
+            _conv_bn_relu(in_channels, n_filters,kernel=5), drop,
+            _conv_bn_relu(n_filters, n_filters,kernel=5), drop,
+            _conv_bn_relu(n_filters, n_filters // 2,kernel=7), drop,
             nn.Conv2d(n_filters // 2, 1, 1))
 
         for m in self.modules():
@@ -75,7 +76,7 @@ class SEBlock(nn.Module):
 # ── Version 1: SE only ────────────────────────────────────────────────────────
 
 class RefinementCNNSE(nn.Module):
-    def __init__(self, in_channels: int, n_filters: int = 32):
+    def __init__(self, in_channels: int, n_filters: int = 32, dropout_rate: float = 0.0):
         super().__init__()
         self.block1 = nn.Sequential(_conv_bn_relu(in_channels, n_filters),
                                     SEBlock(n_filters))
@@ -84,6 +85,7 @@ class RefinementCNNSE(nn.Module):
         self.block3 = nn.Sequential(_conv_bn_relu(n_filters, n_filters // 2),
                                     SEBlock(n_filters // 2))
         self.head   = nn.Conv2d(n_filters // 2, 1, 1)
+        self.drop   = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -93,9 +95,9 @@ class RefinementCNNSE(nn.Module):
         nn.init.constant_(self.head.bias, -2.2)
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
+        x = self.drop(self.block1(x))
+        x = self.drop(self.block2(x))
+        x = self.drop(self.block3(x))
         return self.head(x)
 
 
@@ -118,7 +120,7 @@ class SEResBlock(nn.Module):
 
 
 class RefinementCNNSkip(nn.Module):
-    def __init__(self, in_channels: int, n_filters: int = 32):
+    def __init__(self, in_channels: int, n_filters: int = 32, dropout_rate: float = 0.0):
         super().__init__()
         # Stem: project input to n_filters
         self.stem   = _conv_bn_relu(in_channels, n_filters)
@@ -133,6 +135,7 @@ class RefinementCNNSkip(nn.Module):
             SEBlock(n_filters // 2)
         )
         self.head   = nn.Conv2d(n_filters // 2, 1, 1)
+        self.drop   = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -142,10 +145,10 @@ class RefinementCNNSkip(nn.Module):
         nn.init.constant_(self.head.bias, -2.2)
 
     def forward(self, x):
-        x = self.stem(x)   # (B, n_filters, H, W)
-        x = self.res1(x)   # skip inside SEResBlock
-        x = self.res2(x)   # skip inside SEResBlock
-        x = self.down(x)   # (B, n_filters//2, H, W)
+        x = self.drop(self.stem(x))   # (B, n_filters, H, W)
+        x = self.drop(self.res1(x))   # skip inside SEResBlock
+        x = self.drop(self.res2(x))   # skip inside SEResBlock
+        x = self.down(x)              # (B, n_filters//2, H, W)
         return self.head(x)
 
 
@@ -187,6 +190,104 @@ class RefinementMLP(nn.Module):
         return x
 
 # ── Shared SE for 1D ─────────────────────────────────────────────────────────
+class TemporalGroupProjection1d(nn.Module):
+    """
+    Projects T input channels to fewer channels using group-wise strategy.
+    Operates on (N, 1, T) pixel sequences after reshape.
+    
+    Args:
+        groups: list of (n_input_channels, n_output_channels) tuples.
+                Sum of input channels must == T.
+                Example for T=282: [(50, 50), (50, 25), (182, 40)] → 115 out
+    """
+    def __init__(self, groups: list[tuple[int, int]]):
+        super().__init__()
+        self.groups = groups
+        self.projections = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for in_ch, out_ch in groups:
+            self.projections.append(
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
+            )
+            self.norms.append(nn.BatchNorm1d(out_ch))
+
+        self.total_in = sum(g[0] for g in groups)
+        self.total_out = sum(g[1] for g in groups)
+
+    def forward(self, x):               # (N, 1, T)
+        # x is (N, 1, T) — squeeze the dummy dim, split along T, project each group
+        seq = x.squeeze(1)              # (N, T)
+        parts = []
+        offset = 0
+        for i, (in_ch, out_ch) in enumerate(self.groups):
+            chunk = seq[:, offset:offset + in_ch]       # (N, in_ch)
+            chunk = chunk.unsqueeze(2)                   # (N, in_ch, 1)
+            chunk = F.relu(self.norms[i](self.projections[i](chunk)))  # (N, out_ch, 1)
+            parts.append(chunk)
+            offset += in_ch
+        return torch.cat(parts, dim=1)  # (N, total_out, 1)
+
+############TCN 
+class TemporalGroupProjection1d(nn.Module):
+    """
+    Projects T input channels to fewer channels using group-wise strategy.
+    Operates on (N, 1, T) pixel sequences after reshape.
+
+    Args:
+        groups: list of (n_input_channels, n_output_channels) tuples.
+                Sum of input channels must == T.
+                Example for T=282: [(50, 50), (50, 25), (182, 40)] → 115 out
+    """
+    def __init__(self, groups: list[tuple[int, int]]):
+        super().__init__()
+        self.groups = groups
+        self.projections = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for in_ch, out_ch in groups:
+            self.projections.append(
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
+            )
+            self.norms.append(nn.BatchNorm1d(out_ch))
+
+        self.total_in = sum(g[0] for g in groups)
+        self.total_out = sum(g[1] for g in groups)
+
+    def forward(self, x):               # (N, 1, T)
+        seq = x.squeeze(1)              # (N, T)
+        parts = []
+        offset = 0
+        for i, (in_ch, _) in enumerate(self.groups):
+            chunk = seq[:, offset:offset + in_ch]       # (N, in_ch)
+            chunk = chunk.unsqueeze(2)                   # (N, in_ch, 1)
+            chunk = F.relu(self.norms[i](self.projections[i](chunk)))
+            parts.append(chunk)
+            offset += in_ch
+        return torch.cat(parts, dim=1)  # (N, total_out, 1)
+
+
+class SEBlock1d(nn.Module):
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(channels, max(1, channels // reduction), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(1, channels // reduction), channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        w = self.se(x).unsqueeze(-1)
+        return x * w
+
+
+# ---------------------------------------------------------------------------
+# TCN
+# ---------------------------------------------------------------------------
+
 class TCNBlock(nn.Module):
     def __init__(self, hidden: int, dilation: int):
         super().__init__()
@@ -206,28 +307,47 @@ class TCNBlock(nn.Module):
         x = self.norm2(self.conv2(x))
         x = self.se(x)
         return F.relu(x + residual)
-class SEBlock1d(nn.Module):
-    def __init__(self, channels: int, reduction: int = 8):
-        super().__init__()
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(channels, max(1, channels // reduction), bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(max(1, channels // reduction), channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        w = self.se(x).unsqueeze(-1)
-        return x * w
 
 
 class TCNEncoder(nn.Module):
-    def __init__(self, in_ch: int = 1, hidden: int = 32, out_dim: int = 64):
+    """
+    Args:
+        in_ch:           input channels (1 for raw temporal sequence)
+        hidden:          TCN block channel width
+        out_dim:         feature dim before head
+        T:               number of timesteps
+        spatial_stride:  spatial downsampling factor before pixel loop
+                         (1 = original max_pool2d with stride 2,
+                          >1 = avg_pool2d with this stride)
+        temporal_groups: list of (in_ch, out_ch) tuples for grouped projection.
+                         None → original behavior (Conv1d 1→hidden on full T).
+                         Example: [(50, 50), (50, 25), (182, 40)]
+    """
+    def __init__(self,
+                 in_ch:           int = 1,
+                 hidden:          int = 32,
+                 out_dim:         int = 64,
+                 T:               int = 282,
+                 spatial_stride:  int = 2,
+                 temporal_groups: list[tuple[int, int]] | None = None):
         super().__init__()
-        self.input_proj = nn.Conv1d(in_ch, hidden, kernel_size=1)
-        self.blocks     = nn.ModuleList([
+        self.spatial_stride = spatial_stride
+        self.temporal_groups_cfg = temporal_groups
+
+        if temporal_groups is not None:
+            total_in = sum(g[0] for g in temporal_groups)
+            assert total_in == T, (
+                f"temporal_groups input channels ({total_in}) != T ({T})"
+            )
+            self.temporal_proj = TemporalGroupProjection1d(temporal_groups)
+            # grouped features become the sequence for dilated convs
+            # (N, 1, total_out) → input_proj → (N, hidden, total_out)
+            self.input_proj = nn.Conv1d(1, hidden, kernel_size=1)
+        else:
+            self.temporal_proj = None
+            self.input_proj = nn.Conv1d(in_ch, hidden, kernel_size=1)
+
+        self.blocks = nn.ModuleList([
             TCNBlock(hidden, dilation=d) for d in [1, 2, 4, 8, 16]
         ])
         self.output_proj = nn.Sequential(
@@ -236,7 +356,7 @@ class TCNEncoder(nn.Module):
             nn.Flatten(),
             nn.Linear(hidden, out_dim)
         )
-        self.head = nn.Linear(out_dim, 1)   # pixel logit
+        self.head = nn.Linear(out_dim, 1)
         self._init_weights()
 
     def _init_weights(self):
@@ -249,44 +369,89 @@ class TCNEncoder(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.head.bias, -2.2)  # class-imbalance prior
+        nn.init.constant_(self.head.bias, -2.2)
 
-    # def forward(self, x):
-    #     B, C, H, W = x.shape
-    #     x = x.permute(0, 2, 3, 1).reshape(-1, C).unsqueeze(1)  # (B*H*W, 1, C)
-    #     x = self.input_proj(x)
-    #     for block in self.blocks:
-    #         x = block(x)
-    #     x = self.output_proj(x)          # (B*H*W, out_dim)
-    #     x = self.head(x)                 # (B*H*W, 1)
-    #     return x.reshape(B, 1, H, W)
-    def forward(self, x):# with maxpooling
+    def forward(self, x):
         B, C, H, W = x.shape
-        # Squeeze spatial dims 2x before pixel-wise processing
-        x = F.max_pool2d(x, kernel_size=2, stride=2)   # (B, C, H//2, W//2)
+
+        # --- spatial downsample ---
+        if self.spatial_stride > 1:
+            x = F.avg_pool2d(x, kernel_size=self.spatial_stride,
+                             stride=self.spatial_stride)
         _, _, H2, W2 = x.shape
 
-        x = x.permute(0, 2, 3, 1).reshape(-1, C).unsqueeze(1)  # (B*H2*W2, 1, C)
-        x = self.input_proj(x)
+        x = x.permute(0, 2, 3, 1).reshape(-1, C).unsqueeze(1)  # (N, 1, C=T)
+
+        if self.temporal_proj is not None:
+            # (N, 1, T) → (N, total_out, 1) → transpose → (N, 1, total_out)
+            x = self.temporal_proj(x)
+            x = x.transpose(1, 2)       # (N, 1, total_out)
+            x = self.input_proj(x)       # (N, hidden, total_out)
+        else:
+            x = self.input_proj(x)       # (N, hidden, C)
+
         for block in self.blocks:
             x = block(x)
-        x = self.output_proj(x)          # (B*H2*W2, out_dim)
-        x = self.head(x)                 # (B*H2*W2, 1)
+
+        x = self.output_proj(x)          # (N, out_dim)
+        x = self.head(x)                 # (N, 1)
         x = x.reshape(B, 1, H2, W2)
 
-        # Restore original spatial size
-        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+        # --- restore spatial resolution ---
+        if H2 != H or W2 != W:
+            x = F.interpolate(x, size=(H, W),
+                              mode='bilinear', align_corners=False)
         return x
 
 
+# ---------------------------------------------------------------------------
+# Bidirectional WaveNet
+# ---------------------------------------------------------------------------
+
 class BidirectionalWaveNetEncoder(nn.Module):
-    def __init__(self, in_ch: int = 1, residual_ch: int = 32,
-                 skip_ch: int = 64, T: int = 280):
+    """
+    Args:
+        in_ch:           input channels (1 for raw temporal sequence)
+        residual_ch:     WaveNet residual channels
+        skip_ch:         WaveNet skip channels
+        T:               number of timesteps
+        spatial_stride:  spatial downsampling factor before pixel loop
+                         (1 = no downsampling)
+        temporal_groups: list of (in_ch, out_ch) tuples for grouped projection.
+                         None → original behavior.
+                         Example: [(50, 50), (50, 25), (182, 40)]
+    """
+    def __init__(self,
+                 in_ch:           int = 1,
+                 residual_ch:     int = 32,
+                 skip_ch:         int = 64,
+                 T:               int = 282,
+                 spatial_stride:  int = 2,
+                 temporal_groups: list[tuple[int, int]] | None = None):
         super().__init__()
         self.residual_ch = residual_ch
-        self.dilations   = [1, 2, 4, 8, 16, 1, 2, 4, 8]
+        self.spatial_stride = spatial_stride
+        self.dilations = [1, 2, 4, 8, 16, 1, 2, 4, 8]
 
-        self.input_conv = nn.Conv1d(in_ch, residual_ch, kernel_size=1)
+        # --- temporal grouping ---
+        if temporal_groups is not None:
+            total_in = sum(g[0] for g in temporal_groups)
+            assert total_in == T, (
+                f"temporal_groups input channels ({total_in}) != T ({T})"
+            )
+            self.temporal_proj = TemporalGroupProjection1d(temporal_groups)
+            seq_len = self.temporal_proj.total_out
+            # time_weights apply before grouping, so still size T
+            self.time_weights = nn.Parameter(torch.ones(T))
+            self.input_conv = nn.Conv1d(1, residual_ch, kernel_size=1)
+        else:
+            self.temporal_proj = None
+            seq_len = T  # not used, but for clarity
+            self.time_weights = nn.Parameter(torch.ones(T))
+            self.input_conv = nn.Conv1d(in_ch, residual_ch, kernel_size=1)
+
+        nn.init.constant_(self.time_weights[:min(70, T)], 2.0)
+        nn.init.constant_(self.time_weights[min(70, T):], 1.0)
 
         self.residual_convs = nn.ModuleList([
             nn.Conv1d(residual_ch, residual_ch * 2,
@@ -308,11 +473,6 @@ class BidirectionalWaveNetEncoder(nn.Module):
             SEBlock1d(skip_ch) for _ in self.dilations
         ])
 
-        # T here = number of channels (C), not fixed 280 anymore
-        self.time_weights = nn.Parameter(torch.ones(T))
-        nn.init.constant_(self.time_weights[:min(70, T)], 2.0)
-        nn.init.constant_(self.time_weights[min(70, T):], 1.0)
-
         self.output_se   = SEBlock1d(skip_ch)
         self.output_pool = nn.AdaptiveAvgPool1d(1)
         self.output_head = nn.Sequential(
@@ -321,7 +481,7 @@ class BidirectionalWaveNetEncoder(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2)
         )
-        self.head = nn.Linear(64, 1)     # pixel logit
+        self.head = nn.Linear(64, 1)
         self._init_weights()
 
     def _init_weights(self):
@@ -334,14 +494,29 @@ class BidirectionalWaveNetEncoder(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.head.bias, -2.2)  # class-imbalance prior
+        nn.init.constant_(self.head.bias, -2.2)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(-1, C).unsqueeze(1)  # (B*H*W, 1, C)
 
+        # --- spatial downsample ---
+        if self.spatial_stride > 1:
+            x = F.avg_pool2d(x, kernel_size=self.spatial_stride,
+                             stride=self.spatial_stride)
+        _, _, H2, W2 = x.shape
+
+        x = x.permute(0, 2, 3, 1).reshape(-1, C).unsqueeze(1)  # (N, 1, C=T)
+
+        # time weighting (before grouping — weights full T)
         x = x * self.time_weights.unsqueeze(0).unsqueeze(0)
-        x = self.input_conv(x)
+
+        if self.temporal_proj is not None:
+            # (N, 1, T) → (N, total_out, 1) → transpose → (N, 1, total_out)
+            x = self.temporal_proj(x)
+            x = x.transpose(1, 2)       # (N, 1, total_out)
+            x = self.input_conv(x)       # (N, residual_ch, total_out)
+        else:
+            x = self.input_conv(x)       # (N, residual_ch, T)
 
         skip_sum = None
         for res_conv, skip_conv, res_proj, norm, se in zip(
@@ -359,9 +534,15 @@ class BidirectionalWaveNetEncoder(nn.Module):
 
         skip_sum = self.output_se(F.relu(skip_sum))
         skip_sum = self.output_pool(skip_sum)
-        x        = self.output_head(skip_sum)    # (B*H*W, 64)
-        x        = self.head(x)                  # (B*H*W, 1)
-        return x.reshape(B, 1, H, W)
+        x        = self.output_head(skip_sum)    # (N, 64)
+        x        = self.head(x)                  # (N, 1)
+        x = x.reshape(B, 1, H2, W2)
+
+        # --- restore spatial resolution ---
+        if H2 != H or W2 != W:
+            x = F.interpolate(x, size=(H, W),
+                              mode='bilinear', align_corners=False)
+        return x
 #--------------------------------------------
 #SimpleUnet
 def _conv_bn_relu(in_ch: int, out_ch: int, kernel: int = 3) -> nn.Sequential:
@@ -515,6 +696,95 @@ class UNetSE(nn.Module):
         if pad_h > 0 or pad_w > 0:
             out = F.pad(out, (0, pad_w, 0, pad_h))
         return out
+    
+class RefinementMLPCNN(nn.Module):
+    """
+    Stage 1: Pixel-wise MLP — nonlinear channel mixing / attention
+             (B, in_channels, H, W) → (B, mlp_out, H, W)
+    Stage 2: Sequential CNN — spatial context via growing kernels
+             conv5 → conv7 → conv10, each refining the previous
+             (B, mlp_out, H, W) → (B, mid_ch, H, W)
+    Stage 3: Single linear layer (1x1 conv) → logit
+             (B, mid_ch, H, W) → (B, 1, H, W)
+
+    Input  : (B, in_channels, H, W)
+    Output : raw logit (B, 1, H, W)
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden: tuple = (64, 32),#(3,2),#
+        mid_ch: int = 16,
+    ):
+        super().__init__()
+
+        # ── Stage 1: pixel-wise MLP (channel attention) ──────────────
+        layers = []
+        prev = in_channels
+        for h in hidden:
+            layers += [
+                nn.Linear(prev, h, bias=False),
+                nn.BatchNorm1d(h),
+                nn.ReLU(inplace=True),
+            ]
+            prev = h
+        self.mlp = nn.Sequential(*layers)
+        self.mlp_out = prev
+
+        # ── Stage 2: sequential CNN (spatial context) ─────────────────
+        self.cnn = nn.Sequential(
+            nn.Conv2d(self.mlp_out, mid_ch, kernel_size=5, padding=0, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=7, padding=2, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=10, padding=3, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.unet = SimplerUNet(in_channels=self.mlp_out, dropout_rate=0)
+        # ── Stage 3: single linear head ──────────────────────────────
+        self.head = nn.Conv2d(mid_ch, 1, kernel_size=1, bias=True)
+
+        # ── Init ──────────────────────────────────────────────────────
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        nn.init.constant_(self.head.bias, -2.2)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Stage 1: MLP per pixel
+        x = x.permute(0, 2, 3, 1).reshape(-1, C)
+        x = self.mlp(x)
+        x = x.reshape(B, H, W, self.mlp_out).permute(0, 3, 1, 2)
+        return self.unet(x)
+        # # Stage 2: sequential CNN
+        # x = self.cnn(x)
+        # # Restore original spatial size (conv layers shrink H/W by ~9)
+        # x = x[:, :, :H, :W]                      # trim if larger
+        # pad_h = H - x.shape[2]
+        # pad_w = W - x.shape[3]
+        # if pad_h > 0 or pad_w > 0:
+        #     x = F.pad(x, (0, pad_w, 0, pad_h))
+
+        # # Stage 3: logit
+        # return self.head(x)
 #---------------------------------------------
 #Branched CNN
 def _conv_bn_relu_k(in_ch: int, out_ch: int, kernel: int,
@@ -612,7 +882,13 @@ class LocalSignalCNN(nn.Module):
                 nn.init.zeros_(m.bias)
         nn.init.constant_(self.out.bias, -2.2)
 
+    @staticmethod
+    def _crop(skip: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = target.shape
+        return skip[:, :, :H, :W]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H_in, W_in = x.shape[2], x.shape[3]
         # Encoder
         s1 = self.stem(x)                                        # (B, b,   H,   W)
         x  = self.pool1(self.down1(s1))                          # (B, 2b,  H/2, W/2)
@@ -626,9 +902,16 @@ class LocalSignalCNN(nn.Module):
         x  = self.bottleneck(self.down2(s3))                     # (B, 4b,  H/4, W/4)
 
         # Decoder
-        x  = self.dec1(torch.cat([self.up1(x), s3], dim=1))     # (B, 2b,  H/2, W/2)
-        x  = self.dec2(torch.cat([self.up2(x), s1], dim=1))     # (B, b,   H,   W)
-        return self.out(x)
+        u1 = self.up1(x)
+        x  = self.dec1(torch.cat([u1, self._crop(s3, u1)], dim=1))   # (B, 2b,  H/2, W/2)
+        u2 = self.up2(x)
+        x  = self.dec2(torch.cat([u2, self._crop(s1, u2)], dim=1))   # (B, b,   H,   W)
+        out = self.out(x)
+        pad_h = H_in - out.shape[2]
+        pad_w = W_in - out.shape[3]
+        if pad_h > 0 or pad_w > 0:
+            out = F.pad(out, (0, pad_w, 0, pad_h))
+        return out
 
 
 
@@ -661,7 +944,8 @@ _MODEL_REGISTRY = {
     'wavenet':  BidirectionalWaveNetEncoder,
     'unet':     SimplerUNet,
     'unet_se':  UNetSE,
-    'local_cnn': LocalSignalCNN,
+    'local_cnn':LocalSignalCNN,
+    'mlp_cnn':  RefinementMLPCNN,
 }
 
 
@@ -670,7 +954,11 @@ def build_hybrid_model(
     n_raw_ch: int,
     n_filters: int = 32,
     model_name: str = 'cnn',
+    dropout_rate: float = 0.0,
+    spatial_stride: int = 2,
+    temporal_groups: list[tuple[int, int]] = None,
 ) -> nn.Module:
+    #temporal_groups = [(50, 50), (50, 25), (n_raw_ch-100, 40)]
     if mode == 'prob_only':
         in_ch = 1
     elif mode == 'prob_feat':
@@ -686,14 +974,14 @@ def build_hybrid_model(
                          f"Choose from {list(_MODEL_REGISTRY)}.")
 
     cls = _MODEL_REGISTRY[model_name]
-    if cls is RefinementMLP:
+    if cls is RefinementMLP or cls is RefinementMLPCNN:
         return cls(in_ch)  
     elif cls is BidirectionalWaveNetEncoder:
-        return cls(in_ch=1, residual_ch=n_filters, T=in_ch) 
+        return cls(in_ch=1, residual_ch=n_filters, T=in_ch,spatial_stride=spatial_stride, temporal_groups=temporal_groups) 
     elif cls is TCNEncoder:
-        return cls(in_ch=1, hidden=n_filters)
+        return cls(in_ch=1, hidden=n_filters,temporal_groups=temporal_groups,T=in_ch,spatial_stride=spatial_stride)
     elif cls in (SimplerUNet, UNetSE):
-        return cls(in_channels=in_ch)
+        return cls(in_channels=in_ch,dropout_rate=dropout_rate)
     elif cls is LocalSignalCNN:
-        return cls(in_channels=in_ch, base=n_filters)
-    return cls(in_ch, n_filters=n_filters)
+        return cls(in_channels=in_ch, base=n_filters,dropout_rate=dropout_rate)
+    return cls(in_ch, n_filters=n_filters, dropout_rate=dropout_rate)
